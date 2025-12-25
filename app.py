@@ -101,13 +101,40 @@ def fetch_delta():
 # ==========================
 @st.cache_data(ttl=60)
 def fetch_bybit():
-    res = requests.get(BYBIT_URL, timeout=10).json()
-    data = res.get("result", {}).get("list", [])
+    try:
+        resp = requests.get(BYBIT_URL, timeout=10)
+    except Exception:
+        return {}, {}
 
-    rates, next_funding = {}, {}
+    # ❌ Non-200 response
+    if resp.status_code != 200:
+        return {}, {}
+
+    # ❌ Empty response
+    if not resp.text:
+        return {}, {}
+
+    try:
+        res = resp.json()
+    except Exception:
+        return {}, {}
+
+    # ❌ Unexpected structure
+    if not isinstance(res, dict):
+        return {}, {}
+
+    data = res.get("result", {}).get("list", [])
+    if not isinstance(data, list):
+        return {}, {}
+
+    rates = {}
+    next_funding = {}
     now = time.time()
 
     for r in data:
+        if not isinstance(r, dict):
+            continue
+
         sym = r.get("symbol")
         fr = r.get("fundingRate")
         nft = r.get("nextFundingTime")
@@ -116,7 +143,7 @@ def fetch_bybit():
             continue
 
         try:
-            rates[sym] = float(fr) * 100  # ✅ normalize
+            rates[sym] = float(fr) * 100  # normalize to %
             next_funding[sym] = int((nft / 1000) - now) if nft else None
         except Exception:
             continue
@@ -206,4 +233,5 @@ while True:
         )
 
     time.sleep(REFRESH_SECONDS)
+
 
