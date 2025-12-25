@@ -1,237 +1,215 @@
 import streamlit as st
+import pandas as pd
 import requests
 import time
 from datetime import datetime, timezone
 
-# ==========================
+# ==================================================
 # CONFIG
-# ==========================
-st.set_page_config(page_title="Funding Rate Arbitrage Scanner", layout="wide")
-
-REFRESH_SECONDS = 60
-ALERT_THRESHOLD = 0.10  # %
-
+# ==================================================
 BINANCE_URL = "https://fapi.binance.com/fapi/v1/premiumIndex"
 DELTA_URL = "https://api.india.delta.exchange/v2/tickers?contract_types=perpetual_futures"
 BYBIT_URL = "https://api.bybit.com/v5/market/tickers?category=linear"
 
-TELEGRAM_BOT_TOKEN = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = st.secrets.get("TELEGRAM_CHAT_ID", "")
+HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0"
+}
 
-# ==========================
-# TELEGRAM
-# ==========================
+DEFAULT_THRESHOLD = 0.2  # %
+
+# ===================== TELEGRAM ====================
+ENABLE_TELEGRAM = True
+TELEGRAM_TOKEN = "8564253749:AAE6jcZeKBvL54g662-cJ-kgoWi046YJ0Z0"
+TELEGRAM_CHAT_ID = "1086680348"
+ALERT_BEFORE_MIN = 15
+
+# ==================================================
+# HELPERS
+# ==================================================
+def funding_countdown(ts_ms):
+    if not ts_ms:
+        return "N/A"
+    next_funding = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+    now = datetime.now(timezone.utc)
+    delta = next_funding - now
+    if delta.total_seconds() <= 0:
+        return "Funding now"
+    h = int(delta.total_seconds() // 3600)
+    m = int((delta.total_seconds() % 3600) // 60)
+    return f"{h}h {m}m"
+
+def minutes_to_funding(ts_ms):
+    if not ts_ms:
+        return 9999
+    next_funding = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+    now = datetime.now(timezone.utc)
+    return int((next_funding - now).total_seconds() / 60)
+
 def send_telegram(msg):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not ENABLE_TELEGRAM:
         return
     try:
         requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
-            timeout=10
+            timeout=5
         )
-    except Exception:
+    except:
         pass
 
-# ==========================
-# BINANCE
-# ==========================
-@st.cache_data(ttl=60)
+# ==================================================
+# DATA FETCHERS (CLOUD SAFE)
+# ==================================================
+@st.cache_data(ttl=120)
 def fetch_binance():
+    rates, times = {}, {}
     try:
-        res = requests.get(BINANCE_URL, timeout=10).json()
-    except Exception:
-        return {}, {}
+        res = requests.get(BINANCE_URL, headers=HEADERS, timeout=10).json()
+        for r in res:
+            sym = r.get("symbol")
+            fr = r.get("lastFundingRate")
+            if sym and fr:
+                rates[sym] = float(fr) * 100  # normalize
+                times[sym] = int(r.get("nextFundingTime", 0))
+    except:
+        pass
+    return rates, times
 
-    # 🚨 Binance error response protection
-    if not isinstance(res, list):
-        return {}, {}
-
-    rates = {}
-    next_funding = {}
-    now = time.time()
-
-    for r in res:
-        if not isinstance(r, dict):
-            continue
-
-        sym = r.get("symbol")
-        fr = r.get("lastFundingRate")
-        nft = r.get("nextFundingTime")
-
-        if not sym or fr in ("", None):
-            continue
-
-        try:
-            rates[sym] = float(fr) * 100  # normalize
-            next_funding[sym] = int((nft / 1000) - now) if nft else None
-        except Exception:
-            continue
-
-    return rates, next_funding
-
-# ==========================
-# DELTA
-# ==========================
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=120)
 def fetch_delta():
-    res = requests.get(DELTA_URL, timeout=10).json()
-    data = res.get("result", [])
-
-    rates, next_funding = {}, {}
-
-    for r in data:
-        sym = r.get("symbol")
-        fr = r.get("funding_rate")
-        nft = r.get("next_funding_realization")
-
-        if not sym or fr is None:
-            continue
-
-        try:
-            rates[sym] = float(fr)
-            next_funding[sym] = int((nft / 1_000_000) - time.time()) if nft else None
-        except Exception:
-            continue
-
-    return rates, next_funding
-
-# ==========================
-# BYBIT
-# ==========================
-@st.cache_data(ttl=60)
-def fetch_bybit():
-    try:
-        resp = requests.get(BYBIT_URL, timeout=10)
-    except Exception:
-        return {}, {}
-
-    # ❌ Non-200 response
-    if resp.status_code != 200:
-        return {}, {}
-
-    # ❌ Empty response
-    if not resp.text:
-        return {}, {}
-
-    try:
-        res = resp.json()
-    except Exception:
-        return {}, {}
-
-    # ❌ Unexpected structure
-    if not isinstance(res, dict):
-        return {}, {}
-
-    data = res.get("result", {}).get("list", [])
-    if not isinstance(data, list):
-        return {}, {}
-
     rates = {}
-    next_funding = {}
-    now = time.time()
+    try:
+        res = requests.get(DELTA_URL, headers=HEADERS, timeout=10).json().get("result", [])
+        for r in res:
+            sym = r.get("symbol")
+            fr = r.get("funding_rate")
+            if sym and fr is not None:
+                rates[sym] = float(fr)
+    except:
+        pass
+    return rates
 
-    for r in data:
-        if not isinstance(r, dict):
-            continue
+@st.cache_data(ttl=120)
+def fetch_bybit():
+    rates, times = {}, {}
+    try:
+        resp = requests.get(BYBIT_URL, headers=HEADERS, timeout=10)
+        if resp.status_code != 200:
+            return rates, times
+        data = resp.json().get("result", {}).get("list", [])
+        for r in data:
+            sym = r.get("symbol")
+            fr = r.get("fundingRate")
+            nft = r.get("nextFundingTime")
+            if sym and fr not in ("", None):
+                rates[sym] = float(fr) * 100
+                if nft:
+                    times[sym] = int(nft)
+    except:
+        pass
+    return rates, times
 
-        sym = r.get("symbol")
-        fr = r.get("fundingRate")
-        nft = r.get("nextFundingTime")
-
-        if not sym or fr in ("", None):
-            continue
-
-        try:
-            rates[sym] = float(fr) * 100  # normalize to %
-            next_funding[sym] = int((nft / 1000) - now) if nft else None
-        except Exception:
-            continue
-
-    return rates, next_funding
-
-# ==========================
-# UTILS
-# ==========================
-def countdown(sec):
-    if not sec or sec <= 0:
-        return "N/A"
-    h = sec // 3600
-    m = (sec % 3600) // 60
-    s = sec % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-# ==========================
+# ==================================================
 # UI
-# ==========================
+# ==================================================
+st.set_page_config(page_title="Funding Arbitrage Scanner", layout="wide")
 st.title("📊 Funding Rate Arbitrage Dashboard")
 st.caption("Binance ↔ Delta ↔ Bybit (Live Snapshot)")
 
-container = st.empty()
+if st.button("📩 Test Telegram"):
+    send_telegram("✅ Telegram connected. Funding scanner alerts are live.")
+    st.success("Telegram test message sent")
 
-while True:
-    with container.container():
-        b_rates, b_next = fetch_binance()
-        d_rates, d_next = fetch_delta()
-        y_rates, y_next = fetch_bybit()
+auto_refresh = st.checkbox("🔄 Auto-refresh every 60s", value=True)
+threshold = st.slider("Minimum Funding Difference (%)", 0.05, 5.0, DEFAULT_THRESHOLD, 0.05)
 
-        rows = []
+# ==================================================
+# MAIN LOGIC
+# ==================================================
+binance_rates, binance_next = fetch_binance()
+delta_rates = fetch_delta()
+bybit_rates, bybit_next = fetch_bybit()
 
-        for d_sym, d_rate in d_rates.items():
-            b_sym = d_sym.replace("USD", "USDT")
+rows = []
+alerted = st.session_state.setdefault("alerted", set())
 
-            for ex_name, rates, nxt in [
-                ("Binance", b_rates, b_next),
-                ("Bybit", y_rates, y_next),
-            ]:
-                if b_sym not in rates:
-                    continue
+all_symbols = set(binance_rates) | set(bybit_rates)
 
-                ex_rate = rates[b_sym]
-                diff = d_rate - ex_rate
+for sym in all_symbols:
+    b = binance_rates.get(sym)
+    y = bybit_rates.get(sym)
+    d = delta_rates.get(sym.replace("USDT", "USD"))
 
-                strategy = (
-                    "SHORT Delta, LONG " + ex_name
-                    if diff > 0
-                    else "LONG Delta, SHORT " + ex_name
-                )
+    available = {
+        "Binance": b,
+        "Bybit": y,
+        "Delta": d
+    }
 
-                next_sec = min(
-                    filter(None, [
-                        d_next.get(d_sym),
-                        nxt.get(b_sym)
-                    ]),
-                    default=None
-                )
+    valid = {k: v for k, v in available.items() if v is not None}
+    if len(valid) < 2:
+        continue
 
-                rows.append({
-                    "Symbol": b_sym,
-                    "Exchange": ex_name,
-                    "Delta Rate (%)": round(d_rate, 4),
-                    f"{ex_name} Rate (%)": round(ex_rate, 4),
-                    "Difference (%)": round(diff, 4),
-                    "Next Funding": countdown(next_sec),
-                    "Strategy": strategy
-                })
+    best = None
+    for e1, r1 in valid.items():
+        for e2, r2 in valid.items():
+            if e1 == e2:
+                continue
+            diff = abs(r1 - r2)
+            if diff >= threshold and (best is None or diff > best[2]):
+                best = (e1, e2, diff)
 
-                if abs(diff) >= ALERT_THRESHOLD:
-                    send_telegram(
-                        f"🚨 <b>Funding Arbitrage</b>\n"
-                        f"{b_sym}\n"
-                        f"Delta: {d_rate:.4f}%\n"
-                        f"{ex_name}: {ex_rate:.4f}%\n"
-                        f"Diff: {diff:.4f}%\n"
-                        f"<b>{strategy}</b>"
-                    )
+    if not best:
+        continue
 
-        st.metric("Total Opportunities", len(rows))
-        st.dataframe(rows, use_container_width=True)
+    e1, e2, diff = best
+    long_ex, short_ex = (e1, e2) if valid[e1] < valid[e2] else (e2, e1)
 
-        st.caption(
-            f"Last refresh: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')} "
-            f"| Auto refresh every {REFRESH_SECONDS}s"
-        )
+    ts = binance_next.get(sym) or bybit_next.get(sym)
+    countdown = funding_countdown(ts)
 
-    time.sleep(REFRESH_SECONDS)
+    if ts:
+        mins = minutes_to_funding(ts)
+        key = f"{sym}-{ts}"
+        if mins <= ALERT_BEFORE_MIN and key not in alerted:
+            send_telegram(
+                f"🚨 <b>Funding Arbitrage</b>\n\n"
+                f"<b>{sym}</b>\n"
+                f"LONG <b>{long_ex}</b>\n"
+                f"SHORT <b>{short_ex}</b>\n"
+                f"Diff: <b>{diff:.2f}%</b>\n"
+                f"Funding in <b>{mins} min</b>"
+            )
+            alerted.add(key)
 
+    rows.append({
+        "Symbol": sym,
+        "Binance (%)": b,
+        "Bybit (%)": y,
+        "Delta (%)": d,
+        "Difference (%)": round(diff, 4),
+        "Strategy": f"LONG {long_ex}, SHORT {short_ex}",
+        "Next Funding": countdown
+    })
 
+# ==================================================
+# DISPLAY
+# ==================================================
+st.subheader("📈 Arbitrage Opportunities")
+
+if rows:
+    df = pd.DataFrame(rows).sort_values("Difference (%)", ascending=False)
+    st.metric("Total Opportunities", len(df))
+    st.dataframe(df, use_container_width=True)
+else:
+    st.warning("No strong arbitrage opportunities right now.")
+
+st.caption(datetime.now(timezone.utc).strftime("Last refresh: %H:%M:%S UTC"))
+
+# ==================================================
+# AUTO REFRESH
+# ==================================================
+if auto_refresh:
+    time.sleep(60)
+    st.experimental_rerun()
