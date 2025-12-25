@@ -38,11 +38,23 @@ def send_telegram(msg):
 # ==========================
 @st.cache_data(ttl=60)
 def fetch_binance():
-    res = requests.get(BINANCE_URL, timeout=10).json()
-    rates, next_funding = {}, {}
+    try:
+        res = requests.get(BINANCE_URL, timeout=10).json()
+    except Exception:
+        return {}, {}
+
+    # 🚨 Binance error response protection
+    if not isinstance(res, list):
+        return {}, {}
+
+    rates = {}
+    next_funding = {}
     now = time.time()
 
     for r in res:
+        if not isinstance(r, dict):
+            continue
+
         sym = r.get("symbol")
         fr = r.get("lastFundingRate")
         nft = r.get("nextFundingTime")
@@ -51,7 +63,7 @@ def fetch_binance():
             continue
 
         try:
-            rates[sym] = float(fr) * 100  # ✅ normalize
+            rates[sym] = float(fr) * 100  # normalize
             next_funding[sym] = int((nft / 1000) - now) if nft else None
         except Exception:
             continue
@@ -194,3 +206,4 @@ while True:
         )
 
     time.sleep(REFRESH_SECONDS)
+
